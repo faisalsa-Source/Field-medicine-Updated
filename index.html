@@ -1,0 +1,253 @@
+<script>
+const SHEET_CSV = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQfus1gq3mzES7ddymcU5hylqOrepzbVTV4eCR88GdtOqHrmoUhZVO1hW9l_TFknxfULVtza_nkH8ht/pub?output=csv";
+const AUTO_INTERVAL = 30000; // 30s
+const ENDING_SOON_THRESHOLD = 30; // minutes
+
+const sidebar = document.getElementById('sidebar');
+const menuBtn = document.getElementById('menuBtn');
+const main = document.getElementById('main');
+const stationListEl = document.getElementById('stationList');
+const tbody = document.querySelector('#dataTable tbody');
+const lastUpdatedEl = document.getElementById('lastUpdated');
+const totalOnEl = document.getElementById('totalOn');
+const totalOffEl = document.getElementById('totalOff');
+const totalOOSel = document.getElementById('totalOOS');
+const searchBox = document.getElementById('searchBox');
+const refreshNowBtn = document.getElementById('refreshNow');
+const toggleAutoBtn = document.getElementById('toggleAuto');
+const darkModeBtn = document.getElementById('darkMode');
+const exportJsonBtn = document.getElementById('exportJson');
+const printNightBtn = document.getElementById('printNight');
+const detailPanel = document.getElementById('detailPanel');
+const detailContent = document.getElementById('detailContent');
+const detailTitle = document.getElementById('detailTitle');
+const detailClose = document.getElementById('detailClose');
+const detailPrint = document.getElementById('detailPrint');
+
+let stationsMap = new Map();
+let archiveMap = new Map();
+let pieChart = null;
+let autoTimer = null;
+let autoOn = true;
+let selectedStation = null;
+
+// ================== UTIL ==================
+function escapeHtml(s){
+  if(s===null||s===undefined) return '';
+  return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+function parseTime(str){
+  // parse HH:MM or HH:MM AM/PM
+  const d = new Date();
+  let t = str.trim();
+  if(!t) return null;
+  const m = t.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+  if(!m) return null;
+  let h = parseInt(m[1]), min=parseInt(m[2]);
+  if(m[3]) if(m[3].toUpperCase()==='PM' && h<12) h+=12; else if(m[3].toUpperCase()==='AM' && h===12) h=0;
+  d.setHours(h, min, 0, 0);
+  return d;
+}
+
+function minutesUntil(date){
+  return Math.round((date - new Date())/60000);
+}
+
+// ================== FETCH ==================
+async function fetchSheet(){
+  const url = SHEET_CSV + (SHEET_CSV.includes('?') ? '&' : '?') + '_=' + Date.now();
+  return new Promise((resolve,reject)=>{
+    Papa.parse(url,{download:true,header:true,skipEmptyLines:true,
+      complete:res=>resolve(res.data),
+      error:err=>reject(err)
+    });
+  });
+}
+
+function buildStationMap(rows){
+  const map = new Map();
+  rows.forEach(raw=>{
+    const row = {};
+    for(const k in raw) if(Object.prototype.hasOwnProperty.call(raw,k)) row[k.trim()]=raw[k];
+
+    const station = (row["ZONE NAME"]||"Unknown").toString().trim();
+    const date = (row["DATE"]||"").toString().trim();
+    const start = (row["START TIME"]||"").toString().trim();
+    const end = (row["END TIME"]||"").toString().trim();
+    const tl = (row["TL NAME"]||"").toString().trim();
+    const ambOn = parseInt(row["AMBULANCES ON DUTY"]||0);
+    const ambOff = parseInt(row["AMBULANCE OFF DUTY"]||0);
+    const ambOOS = parseInt(row["OUT OF SERVICE"]||0);
+    const golfOn = parseInt(row["GOLF CARS ON DUTY"]||0);
+    const golfOff = parseInt(row["GOLF CARS OFF DUTY"]||0);
+    const golfOOS = parseInt(row["Golf Cars Out Of Service"]||0);
+    const clinics = parseInt(row["Number of Clinics"]||0);
+    const paramedics = parseInt(row["Number of Paramedics"]||0);
+    const doctors = parseInt(row["Number of Doctors"]||0);
+    const nurses = parseInt(row["Number of Nurses"]||0);
+    const footed = (row["Total Footed Team"]||"").toString();
+    const notes = (row["Notes"]||"").toString();
+
+    const entry = {station,date,start,end,tl,ambOn,ambOff,ambOOS,golfOn,golfOff,golfOOS,clinics,paramedics,doctors,nurses,footed,notes,rawRow:row};
+    if(!map.has(station)) map.set(station,[]);
+    map.get(station).push(entry);
+  });
+  return map;
+}
+
+// ================== RENDER ==================
+function moveToArchive(){
+  const now = new Date();
+  for(const [station, arr] of stationsMap.entries()){
+    const active = [];
+    arr.forEach(r=>{
+      const endDate = parseTime(r.end);
+      if(endDate && endDate <= now){
+        if(!archiveMap.has(station)) archiveMap.set(station,[]);
+        archiveMap.get(station).push(r);
+      } else {
+        active.push(r);
+      }
+    });
+    if(active.length) stationsMap.set(station,active);
+    else stationsMap.delete(station);
+  }
+}
+
+function renderSidebar(){
+  stationListEl.innerHTML='';
+  const q = (searchBox.value||'').toLowerCase().trim();
+  const keys = Array.from(stationsMap.keys()).sort((a,b)=>a.localeCompare(b, undefined,{numeric:true}));
+  keys.forEach(name=>{
+    if(q && !name.toLowerCase().includes(q)) return;
+    const latest = stationsMap.get(name).slice(-1)[0];
+    const el = document.createElement('div');
+    el.className='station-item'+(selectedStation===name?' selected':'');
+    let endingSoonBadge='';
+    const endDate = parseTime(latest.end);
+    if(endDate){
+      const mins = minutesUntil(endDate);
+      if(mins<=ENDING_SOON_THRESHOLD && mins>0) endingSoonBadge='<span class="ending-soon">Ending Soon</span>';
+    }
+    el.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center">
+        <strong>${escapeHtml(name)}</strong>
+        <div style="font-size:12px;color:var(--text);opacity:.85">${escapeHtml(latest.start)}</div>
+      </div>
+      <div class="meta">
+        <div>Amb: ${latest.ambOn}/${latest.ambOff} OOS:${latest.ambOOS}</div>
+        <div>Golf: ${latest.golfOn}/${latest.golfOff}</div>
+      </div>
+      ${endingSoonBadge}`;
+    el.addEventListener('click',()=>{selectedStation=name;highlightSelected();showDetail(name);});
+    stationListEl.appendChild(el);
+  });
+}
+
+function renderTable(){
+  tbody.innerHTML='';
+  const rows=[];
+  for(const arr of stationsMap.values()) rows.push(...arr); // show all active shifts
+  rows.sort((a,b)=>a.station.localeCompare(b.station, undefined,{numeric:true}));
+  rows.forEach(r=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td style="text-align:left;padding-left:10px">${escapeHtml(r.station)}</td>
+      <td>${r.ambOn}</td><td>${r.ambOff}</td><td>${r.ambOOS}</td>
+      <td>${escapeHtml(r.start)}</td><td>${escapeHtml(r.end)}</td>`;
+    tr.addEventListener('click',()=>{selectedStation=r.station;highlightSelected();showDetail(r.station);});
+    tbody.appendChild(tr);
+  });
+}
+
+function updateMetrics(){
+  let totalOn=0,totalOff=0,totalOOS=0;
+  for(const arr of stationsMap.values()){
+    arr.forEach(r=>{totalOn+=r.ambOn; totalOff+=r.ambOff; totalOOS+=r.ambOOS;});
+  }
+  totalOnEl.textContent=totalOn;
+  totalOffEl.textContent=totalOff;
+  totalOOSel.textContent=totalOOS;
+  const ctx=document.getElementById('pie').getContext('2d');
+  if(pieChart) pieChart.destroy();
+  pieChart=new Chart(ctx,{type:'pie',data:{labels:['ON','OFF','OOS'],datasets:[{data:[totalOn,totalOff,totalOOS],backgroundColor:['#22c55e','#ef4444','#f59e0b']}]},options:{plugins:{legend:{position:'bottom'}}}});
+}
+
+function highlightSelected(){
+  document.querySelectorAll('.station-item').forEach(el=>{
+    el.classList.remove('selected');
+    const strong = el.querySelector('strong');
+    if(strong && strong.innerText===selectedStation) el.classList.add('selected');
+  });
+}
+
+function showDetail(stationName){
+  const arr = stationsMap.get(stationName) || archiveMap.get(stationName) || [];
+  if(!arr.length) return;
+  detailTitle.textContent=stationName;
+  let html='';
+  arr.forEach((r,i)=>{
+    html+=`<div style="font-family:system-ui;margin-bottom:14px"><div style="font-weight:700;margin-bottom:4px">Shift ${i+1}</div>`;
+    html+=`<div class="detail-row"><span class="kv">Date:</span> ${escapeHtml(r.date)}</div>`;
+    html+=`<div class="detail-row"><span class="kv">Start Time:</span> ${escapeHtml(r.start)}</div>`;
+    html+=`<div class="detail-row"><span class="kv">End Time:</span> ${escapeHtml(r.end)}</div>`;
+    html+=`<hr>`;
+    html+=`<div class="detail-row"><span class="kv">TL Name:</span> ${escapeHtml(r.tl)}</div>`;
+    html+=`<hr>`;
+    html+=`<div class="detail-row"><strong>AMBULANCES</strong></div>`;
+    html+=`<div class="detail-row">Total On: ${r.ambOn} • Off: ${r.ambOff} • OOS: ${r.ambOOS}</div>`;
+    html+=`<hr>`;
+    html+=`<div class="detail-row"><strong>GOLF CARS</strong></div>`;
+    html+=`<div class="detail-row">On: ${r.golfOn} • Off: ${r.golfOff} • OOS: ${r.golfOOS}</div>`;
+    html+=`<hr>`;
+    html+=`<div class="detail-row">Clinics: ${r.clinics} • Paramedics: ${r.paramedics}</div>`;
+    html+=`<div class="detail-row">Doctors: ${r.doctors} • Nurses: ${r.nurses}</div>`;
+    html+=`<div class="detail-row">Total Footed Team: ${escapeHtml(r.footed)}</div>`;
+    html+=`<hr>`;
+    html+=`<div class="detail-row"><strong>Notes:</strong><div style="margin-top:6px">${escapeHtml(r.notes)}</div></div></div>`;
+  });
+  detailContent.innerHTML=html;
+  detailPanel.classList.add('open');
+  detailPanel.setAttribute('aria-hidden','false');
+
+  detailPrint.onclick=()=>{
+    const w=window.open('','_blank','width=700,height=900');
+    w.document.write(`<pre style="font-family:system-ui">${escapeHtml(detailContent.innerText)}</pre>`);
+    w.document.close(); w.focus(); w.print();
+  };
+}
+
+// ================== CONTROLS ==================
+menuBtn.addEventListener('click',()=>{sidebar.classList.toggle('open'); main.classList.toggle('shift');});
+detailClose.addEventListener('click',()=>{detailPanel.classList.remove('open'); detailPanel.setAttribute('aria-hidden','true');});
+refreshNowBtn.addEventListener('click',refreshAll);
+toggleAutoBtn.addEventListener('click',function(){autoOn=!autoOn; if(autoOn){startAuto(); this.textContent='Auto: 30s (ON)';} else{stopAuto(); this.textContent='Auto: OFF';}});
+darkModeBtn.addEventListener('click',()=>{document.body.classList.toggle('dark'); localStorage.setItem('darkMode',document.body.classList.contains('dark')?'1':'0');});
+if(localStorage.getItem('darkMode')==='1') document.body.classList.add('dark');
+exportJsonBtn.addEventListener('click',()=>{
+  const out=[]; for(const [k,arr] of stationsMap.entries()) out.push(...arr.map(r=>r.rawRow));
+  const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='stations_latest.json'; a.click();
+});
+searchBox.addEventListener('input',renderSidebar);
+
+// ================== AUTO REFRESH ==================
+async function refreshAll(){
+  try{
+    refreshNowBtn.disabled=true; refreshNowBtn.textContent='⏳';
+    const rows=await fetchSheet();
+    stationsMap=buildStationMap(rows);
+    moveToArchive();
+    renderSidebar();
+    renderTable();
+    updateMetrics();
+    lastUpdatedEl.textContent='Last: '+new Date().toLocaleTimeString();
+    highlightSelected();
+  }catch(err){console.error('Failed to load sheet',err);}
+  finally{refreshNowBtn.disabled=false; refreshNowBtn.textContent='🔄 Refresh';}
+}
+
+function startAuto(){if(autoTimer) clearInterval(autoTimer); autoTimer=setInterval(refreshAll,AUTO_INTERVAL);}
+function stopAuto(){if(autoTimer) clearInterval(autoTimer); autoTimer=null;}
+
+refreshAll();
+startAuto();
+</script>
